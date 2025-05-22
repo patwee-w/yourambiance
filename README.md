@@ -1,4 +1,4 @@
-# Your Ambiance Project
+# YourAmbiance Project
 
 ## 1) Hugging Face Hub Token is needed for pyannote to operate.
 
