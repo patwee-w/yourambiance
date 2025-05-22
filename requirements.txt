@@ -3,6 +3,9 @@
 # Versions are specifically pinned to match the environment from which this list was generated,
 # ensuring reproducibility.
 
+# Python version
+3.10.9
+
 # Core GUI
 customtkinter==5.2.2
 
