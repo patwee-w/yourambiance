@@ -1,0 +1,39 @@
+# requirements.txt
+# This file lists the Python packages required for the YourAmbiance application.
+# Versions are specifically pinned to match the environment from which this list was generated,
+# ensuring reproducibility.
+
+# Core GUI
+customtkinter==5.2.2
+
+# Numerical operations and Audio processing
+numpy==2.2.6
+librosa==0.11.0
+sounddevice==0.5.2
+soundfile==0.13.1
+pydub==0.25.1
+
+# Deep Learning Framework (PyTorch)
+# IMPORTANT: The '+cpu' in torch and torchaudio indicates a CPU-only installation.
+# If the user has an NVIDIA GPU and wants to use it, they will need to install
+# a CUDA-enabled version of PyTorch and torchaudio.
+# Refer to: https://pytorch.org/get-started/locally/
+torch==2.7.0+cpu
+torchaudio==2.7.0+cpu
+
+# Demucs for source separation
+demucs==4.0.1
+
+# Scikit-learn for KMeans clustering
+scikit-learn==1.6.1
+
+# TensorFlow and TensorFlow Hub for YAMNet model
+tensorflow==2.19.0
+tensorflow-hub==0.16.1
+
+# Pyannote.audio for speaker diarization
+pyannote.audio==3.3.2
+huggingface-hub==0.31.1 # Needed for Pyannote login
+
+# Environment variables
+python-dotenv==1.1.0
