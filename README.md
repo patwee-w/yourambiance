@@ -1,5 +1,7 @@
 # YourAmbiance Project
 
+**YourAmbiance** was developed as an entry for the Leagues of Code Hackathon held in May 2025. Using Demucs for sound separation, YAMNet for audio classification, and SpeechBrain's Sepformer for speaker diarization, the app allows users to identify, isolate, and control specific audio elements in their environment through an interactive GUI. Guidelines are provided below to ensure full use. 
+
 ## 1) Hugging Face Hub Token is needed for pyannote to operate.
 
 This project uses `pyannote.audio` for speaker diarization and segmentation. To use `pyannote.audio` models from the Hugging Face Hub, you **must** obtain a Hugging Face Hub API token and explicitly accept the user conditions for the specific models.
