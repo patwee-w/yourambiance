@@ -37,3 +37,8 @@ huggingface-hub==0.31.1 # Needed for Pyannote login
 
 # Environment variables
 python-dotenv==1.1.0
+
+# Fonts Used
+Edwardian Script ITC
+TT Hoves Pro Trial Medium
+Arial
