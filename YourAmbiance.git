@@ -1,1 +1,640 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from customtkinter import *
+import numpy as np
+import librosa
+import sounddevice as sd
+import torchaudio
+import torch
+import tempfile
+import os
+import soundfile as sf
+from demucs.pretrained import get_model
+from demucs.apply import apply_model
+import tensorflow as tf
+import tensorflow_hub as hub
+from pyannote.audio import Pipeline
+from huggingface_hub import login
+from pydub import AudioSegment
+from dotenv import load_dotenv
+import threading
 
+
+# Load environment from .env file
+load_dotenv()
+
+# Model Variables
+pyannote_pipeline = None
+yamnet_model = None
+yamnet_class_names = []
+scrollable_window_id = None 
+
+# GUI
+root = CTk()
+root.title("YourAmbiance Application")
+root.geometry("450x650")
+
+# Assuming these are defined elsewhere or need to be added for your GUI styling
+# Example placeholders if not defined (replace with your actual definitions):
+font_tt = "Arial" # Placeholder font for CTk components
+color_blue = "#1f6aa5" # Placeholder color for CTk components
+
+# Custom Temp Dir
+CUSTOM_TEMP_DIR = os.path.normpath(os.path.join(tempfile.gettempdir(), "YourAmbianceTemp"))
+
+# Ensure this custom temp directory exists
+if not os.path.exists(CUSTOM_TEMP_DIR):
+    try:
+        os.makedirs(CUSTOM_TEMP_DIR)
+        print(f"Created custom temporary directory: {CUSTOM_TEMP_DIR}")
+    except Exception as e:
+        # Use root.after for GUI updates from a potentially non-main thread context
+        if 'root' in globals() and root:
+            root.after(0, lambda: messagebox.showerror("Error", f"Could not create custom temp directory {CUSTOM_TEMP_DIR}: {e}\n"
+                                                               "Falling back to default temp directory. Please ensure sufficient permissions."))
+        else:
+            print(f"Error: Could not create custom temp directory {CUSTOM_TEMP_DIR}: {e}. Falling back to default.")
+        CUSTOM_TEMP_DIR = os.path.abspath(tempfile.gettempdir())
+        print(f"Falling back to default temp directory: {CUSTOM_TEMP_DIR}")
+
+
+# Load Models
+
+def load_yamnet_model():
+    global yamnet_model, yamnet_class_names
+    if yamnet_model is not None:
+        return # Already loaded
+    print("Attempting to load YAMNet model...")
+    try:
+        yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
+        print("YAMNet model loaded successfully.")
+
+        class_map_path = tf.keras.utils.get_file(
+            'yamnet_class_map.csv',
+            'https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv'
+        )
+        yamnet_class_names = [line.strip().split(',')[2].strip('"') for line in open(class_map_path).readlines()[1:]]
+        print("YAMNet class names loaded.")
+    except Exception as e:
+        if 'root' in globals() and root: # Check if root exists for messagebox
+            root.after(0, lambda: messagebox.showerror("YAMNet Model Load Error", f"Could not load YAMNet model or class names: {e}"))
+        print(f"Error loading YAMNet model: {e}")
+        yamnet_model = None
+        yamnet_class_names = []
+
+
+def load_pyannote_pipeline():
+    global pyannote_pipeline
+    if pyannote_pipeline is not None:
+        return # Already loaded
+    print("Attempting to load Pyannote audio pipeline...")
+    try:
+        hf_token = os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if hf_token:
+            login(token=hf_token)
+            print("Logged into Hugging Face Hub using environment variable.")
+        else:
+            if 'root' in globals() and root: # Check if root exists for messagebox
+                root.after(0, lambda: messagebox.showwarning("Hugging Face Token Missing",
+                                         "HUGGING_FACE_HUB_TOKEN environment variable not set. "
+                                         "Pyannote models require authentication. Speaker analysis might fail."))
+            print("HUGGING_FACE_HUB_TOKEN environment variable not found. Pyannote may fail.")
+            return
+
+        pyannote_pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=True # Set to True, or your specific token if not using login()
+        )
+        print("Pyannote audio pipeline loaded successfully.")
+
+        if torch.cuda.is_available():
+            pyannote_pipeline.to(torch.device("cuda"))
+            print("Pyannote pipeline moved to GPU.")
+        else:
+            pyannote_pipeline.to(torch.device("cpu"))
+            print("Pyannote pipeline running on CPU (CUDA not available).")
+
+    except Exception as e:
+        if 'root' in globals() and root: # Check if root exists for messagebox
+            root.after(0, lambda: messagebox.showerror("Pyannote Model Load Error", f"Could not load Pyannote pipeline: {e}\n"
+                                                      "Ensure you've accepted user conditions on Hugging Face Hub "
+                                                      "and set your HUGGING_FACE_HUB_TOKEN environment variable."))
+        print(f"Error loading Pyannote pipeline: {e}")
+        pyannote_pipeline = None
+
+
+# Audio Processing with Yamnet
+
+def get_yamnet_detections(audio_path, top_k=5):
+    if yamnet_model is None or not yamnet_class_names or not os.path.exists(audio_path):
+        print(f"Warning: YAMNet model not loaded, class names missing, or file not found: {audio_path}. Returning empty detections.")
+        return []
+
+    try:
+        waveform, sr = librosa.load(audio_path, sr=16000, mono=True)
+        waveform = waveform[:min(waveform.shape[0], 16000 * 10)] # Limit to 10 seconds
+        
+        # YAMNet expects input as a tf.Tensor
+        scores, embeddings, _ = yamnet_model(tf.constant(waveform, dtype=tf.float32))
+        
+        mean_scores = tf.reduce_mean(scores, axis=0).numpy()
+        top_indices = mean_scores.argsort()[-top_k:][::-1]
+        filtered_detections = []
+        for i in top_indices:
+            label = yamnet_class_names[i]
+            score = mean_scores[i]
+            if score >= 0.05 and "inside" not in label.lower(): # Remove classes named inside, score requirement higher than 0.01
+                filtered_detections.append((label, float(score)))
+        return filtered_detections
+    
+    except Exception as e:
+        print(f"Error getting YAMNet detections for {audio_path}: {e}")
+        return []
+
+
+# Separate Speaker Segments with Pyannote
+
+def separate_speakers(audio_path, original_demucs_cluster_label):
+    global pyannote_pipeline
+    if pyannote_pipeline is None:
+        if 'root' in globals() and root:
+             root.after(0, lambda: messagebox.showerror("Pyannote Error", "Pyannote pipeline not loaded. Cannot separate speakers."))
+        print("Pyannote pipeline not loaded in separate_speakers.")
+        return []
+
+    try:
+        print(f"Pyannote attempting to diarize: {audio_path}")
+        if not os.path.exists(audio_path):
+            if 'root' in globals() and root:
+                 root.after(0, lambda: messagebox.showerror("File Error", f"Audio file not found for diarization: {audio_path}"))
+            print(f"Audio file not found for diarization: {audio_path}")
+            return []
+
+        original_audio = AudioSegment.from_wav(audio_path)
+        diarization = pyannote_pipeline(audio_path)
+
+        speaker_segments = {}
+
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            start_ms = turn.start * 1000
+            end_ms = turn.end * 1000
+
+            segment_audio = original_audio[start_ms:end_ms]
+
+            if speaker not in speaker_segments:
+                speaker_segments[speaker] = AudioSegment.empty()
+            speaker_segments[speaker] += segment_audio
+
+        new_speaker_paths_info = [] 
+        
+        for speaker_label, audio_segment in speaker_segments.items():
+            # Sanitize speaker_label for use in filename
+            safe_speaker_label = "".join(c if c.isalnum() or c in (' ', '_') else '_' for c in speaker_label).replace(' ', '_')
+            # Use original_demucs_cluster_label as a general group ID
+            out_path = os.path.normpath(os.path.join(CUSTOM_TEMP_DIR, f"demucs_group_{original_demucs_cluster_label}_speaker_{safe_speaker_label}.wav"))
+            
+            print(f"Saving speaker {speaker_label} to: {out_path}")
+            try:
+                audio_segment.export(out_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
+                
+                sp_yamnet_detections = get_yamnet_detections(out_path)
+
+                new_speaker_paths_info.append({
+                    'path': out_path,
+                    'label': f"Speaker: {speaker_label}",
+                    'raw_yamnet_detections': sp_yamnet_detections,
+                    'demucs_type': 'speaker', 
+                    'cluster': original_demucs_cluster_label, # Inherit cluster/group from parent vocal track
+                    'is_speaker_separated': True
+                })
+            except Exception as save_e:
+                if 'root' in globals() and root:
+                    root.after(0, lambda msg=f"Could not save speaker file {out_path}: {save_e}": messagebox.showerror("Speaker File Save Error", msg))
+                print(f"Error saving speaker file {out_path}: {save_e}")
+                continue
+
+        return new_speaker_paths_info
+
+    except Exception as e:
+        if 'root' in globals() and root:
+            root.after(0, lambda msg=str(e): messagebox.showerror("Speaker Diarization Error", f"Pyannote diarization failed: {msg}"))
+        print(f"Speaker diarization main error: {e}")
+        return []
+
+# Separate Audio Groups with Demucs
+
+def separate_audio_components(file_path):
+    print("Starting Demucs separation...")
+    model = get_model(name="htdemucs")
+    model.to("cpu") # Ensure model is on CPU if not using CUDA elsewhere explicitly for Demucs
+    
+    wav, sr = torchaudio.load(file_path)
+    
+    # Ensure wav is 2D (channels, samples) / Normalize info
+    if wav.ndim == 1:
+        wav = wav.unsqueeze(0) # Add channel dimension
+        
+    wav = (wav - wav.mean()) / wav.std() # Normalize per channel
+    
+    # Demucs expects batch dimension: (batch, channels, samples)
+    sources = apply_model(model, wav.unsqueeze(0), device="cpu", split=True, overlap=0.25, progress=True)[0]
+
+    sources = sources.mean(dim=1) # Average channels to get mono sources
+
+    temp_files_info = []
+    print(f"Demucs separation - Absolute Temp Dir: {CUSTOM_TEMP_DIR}")
+
+    component_names = ["vocals", "drums", "bass", "other"] # Demucs output groups "components"
+
+    for i, source_wav in enumerate(sources):
+        component_name = component_names[i] if i < len(component_names) else f"component_{i}"
+        temp_path = os.path.normpath(os.path.join(CUSTOM_TEMP_DIR, f"demucs_separated_{component_name}.wav"))
+
+        print(f"Demucs separation - Attempting to write file: {temp_path}")
+        try:
+            # sf.write expects (samples, channels) or (samples,) for mono
+            sf.write(temp_path, source_wav.cpu().numpy().T, sr) 
+            temp_files_info.append({"path": temp_path, "type": component_name})
+        except Exception as e:
+            if 'root' in globals() and root:
+                    root.after(0, lambda msg=f"Error writing separated audio to {temp_path}: {e}": messagebox.showerror("Demucs File Write Error", msg))
+            print(f"Critical Error: Could not write {temp_path}. Details: {e}")
+            return [] # Stop if one write fails
+    print("Demucs separation finished.")
+    return temp_files_info
+
+# Processed audio's file path
+def process_audio(file_path):
+    global separated_data
+    separated_data = []
+
+    demucs_outputs = separate_audio_components(file_path)
+    if not demucs_outputs:
+        if 'root' in globals() and root:
+            root.after(0, lambda: messagebox.showerror("Processing Error", "Demucs audio separation failed. Please check console for details."))
+        return []
+
+    # Removed: items_for_clustering list is no longer needed
+
+    for i, demucs_item in enumerate(demucs_outputs): # Use enumerate to get an index for 'cluster'
+        path = demucs_item['path']
+        component_type = demucs_item['type']
+        
+        yamnet_top_detections = get_yamnet_detections(path)
+        
+        label_parts = [f"{label}" for label, score in yamnet_top_detections[:3]]
+
+        total_yamnet_score = sum(score for label, score in yamnet_top_detections) 
+
+        if total_yamnet_score < 0.10: 
+            label_text = "Likely silence" 
+        else: 
+            label_text = f"{', '.join(label_parts)}" if label_parts else "No significant sounds detected"
+
+        # Embeddings are still calculated for potential future use (e.g., more advanced analysis)
+        embedding = np.zeros(1024) 
+        try:
+            waveform_for_embedding, _ = librosa.load(path, sr=16000, mono=True)
+            waveform_for_embedding = waveform_for_embedding[:min(waveform_for_embedding.shape[0], 16000 * 10)]
+            if yamnet_model is not None:
+                _, tf_embeddings, _ = yamnet_model(tf.constant(waveform_for_embedding, dtype=tf.float32))
+                embedding = tf.reduce_mean(tf_embeddings, axis=0).numpy()
+            else:
+                print("Warning: YAMNet model not loaded, cannot get embedding.")
+        except Exception as e:
+            print(f"Error getting YAMNet embedding for {path}: {e}")
+        
+        item_data = {
+            'path': path,
+            'label': label_text,
+            'embedding': embedding,
+            'demucs_type': component_type,
+            'cluster': i, # Assign a unique 'cluster' ID based on Demucs order (0 for vocals, 1 for drums, etc.)
+            'is_speaker_separated': False,
+            'raw_yamnet_detections': yamnet_top_detections
+        }
+        
+        separated_data.append(item_data)
+    
+    return separated_data
+
+
+# Play function
+def play_audio(file_path):
+    try:
+        if not os.path.exists(file_path):
+            root.after(0, lambda: messagebox.showerror("Playback Error", f"Audio file not found for playback: {file_path}"))
+            print(f"Skipping missing file: {file_path}")
+            return
+
+        waveform, sr = librosa.load(file_path, sr=44100) # Consistent sample rate
+        sd.play(waveform, 44100)
+        sd.wait()
+    except Exception as e:
+        root.after(0, lambda: messagebox.showerror("Playback Error", str(e)))
+
+
+# Switch frame
+def show_frame(frame):
+    root.after(0, frame.tkraise) 
+
+# Select audio file
+def select_audio():
+    path = filedialog.askopenfilename(filetypes=[("Audio Files", "*.wav *.mp3")])
+    if path:
+        def process_and_update_gui_thread_task():
+            root.after(0, lambda: messagebox.showinfo("Processing", "Starting audio processing. This may take a moment...", icon="info"))
+            
+            results = process_audio(path)
+            
+            if results:
+                root.after(0, lambda: populate_checkboxes(results))
+                root.after(0, lambda: show_frame(page2))
+                root.after(0, lambda: messagebox.showinfo("Processing Complete", "Audio processing finished. Check console for details."))
+            else:
+                root.after(0, lambda: messagebox.showerror("Processing Failed", "Audio processing did not yield results. Check console."))
+
+        threading.Thread(target=process_and_update_gui_thread_task, daemon=True).start()
+
+
+checkbox_vars = []
+checkbox_audio_paths = []
+volume_sliders = []
+
+# Tick checkboxes to select which clusters to play
+def populate_checkboxes(separated_data_list):
+    global checkbox_vars, checkbox_audio_paths, volume_sliders
+    
+    for widget in checkbox_frame.winfo_children():
+        widget.destroy()
+    checkbox_vars = []
+    checkbox_audio_paths = []
+    volume_sliders = []
+
+    normalized_data_for_display = []
+    for item in separated_data_list:
+        if isinstance(item, dict):
+            normalized_data_for_display.append({
+                'path': item.get('path', ''),
+                'label': item.get('label', 'Unknown Audio'),
+                'embedding': item.get('embedding', np.zeros(1024)), # Default embedding
+                'demucs_type': item.get('demucs_type', 'unknown'),
+                'cluster': item.get('cluster', 0), # Will be 0 or the Demucs index, or inherited from parent vocal track
+                'is_speaker_separated': item.get('is_speaker_separated', False),
+                'raw_yamnet_detections': item.get('raw_yamnet_detections', [])
+            })
+        else:
+            print(f"Warning: Unexpected item type: {type(item)}. Skipping.")
+            continue
+    
+    # Sort order: speaker-separated items first, then by Demucs type, then by their assigned group/cluster, then label
+    sorted_data = sorted(normalized_data_for_display,
+                         key=lambda x: (
+                             not x.get('is_speaker_separated', False), # False (speaker tracks) come before True (non-speaker)
+                             x.get('demucs_type', ''),
+                             x.get('cluster', 0), # Sort by the Demucs group ID (0,1,2,3) or inherited speaker group
+                             x.get('label', '')
+                         ))
+
+    print("Now available for audio playback. Populate checkboxes.")
+    for i, item_data_dict in enumerate(sorted_data):
+        var = tk.BooleanVar(value=False) # Default to unselected
+        
+        # Checkbox
+        cb_text = item_data_dict.get('label', 'Unnamed Audio Track')
+        cb = CTkCheckBox(checkbox_frame, text=cb_text, variable=var, 
+                         corner_radius=18, checkbox_width=25, checkbox_height=25, fg_color=color_blue,
+                         font=(font_tt, 12)
+                         )
+        cb.pack(anchor='center', pady=(8, 2), padx=10)
+
+        # Slider
+        slider = CTkSlider(master=checkbox_frame, from_=0, to=200, orientation="horizontal", width=250)
+        slider.set(100) # Default volume
+        slider.pack(pady=(0, 8), fill='x', padx=30, anchor='center')
+
+        checkbox_vars.append(var)
+        checkbox_audio_paths.append(item_data_dict) # Store the whole dict
+        volume_sliders.append(slider)
+
+        # Conditions for showing "Analyze Speakers" button
+        yamnet_top_detections = item_data_dict.get('raw_yamnet_detections', [])
+        # More robust check for speech-like sounds from YAMNet
+        speech_keywords = {"speech", "spoken word", "singing", "narration", "babbling", "child speech"}
+        yamnet_says_speech = any(
+            any(keyword in det[0].lower() for keyword in speech_keywords) 
+            for det in yamnet_top_detections[:3] # Check top 3 YAMNet detections
+        )
+        
+        is_already_separated_speaker = item_data_dict.get('is_speaker_separated', False)
+
+        # Show speaker separation button if YAMNet detects speech AND it's not already a speaker-separated segment
+        if yamnet_says_speech and not is_already_separated_speaker:
+            def make_speaker_sep_callback(audio_path_to_sep=item_data_dict['path'], 
+                                          original_demucs_group_id=item_data_dict['cluster']): # Pass Demucs group ID
+                def callback():
+                    print(f"Speaker analysis requested for: {audio_path_to_sep}, from Demucs group {original_demucs_group_id}")
+                    def run_speaker_analysis_thread_task():
+                        root.after(0, lambda: messagebox.showinfo("Speaker Analysis", "Starting speaker analysis. This may take a moment...", icon="info"))
+                        
+                        if pyannote_pipeline is None:
+                            root.after(0, lambda: messagebox.showwarning("Pyannote Not Loaded", "Pyannote pipeline is not loaded. Attempting to load now..."))
+                            load_pyannote_pipeline()
+                            if pyannote_pipeline is None:
+                                root.after(0, lambda: messagebox.showerror("Pyannote Load Failed", "Could not load Pyannote pipeline. Speaker analysis cancelled."))
+                                return
+
+                        # Call separate_speakers which returns a list of dicts
+                        speaker_separated_info_list = separate_speakers(audio_path_to_sep, original_demucs_group_id)
+
+                        if speaker_separated_info_list:
+                            # Pass the list of dicts to the GUI update function
+                            root.after(0, lambda: add_new_speaker_checkboxes_to_gui(speaker_separated_info_list))
+                            root.after(0, lambda: messagebox.showinfo("Speaker Separation Complete", f"Found {len(speaker_separated_info_list)} speakers. New tracks added."))
+                        else:
+                            root.after(0, lambda: messagebox.showwarning("Speaker Separation", "No new speakers found or an error occurred during separation."))
+                        
+                    threading.Thread(target=run_speaker_analysis_thread_task, daemon=True).start()
+                return callback
+
+            sep_button = CTkButton(checkbox_frame, text="🗣️ Analyze Speakers in this segment", 
+                                   font=(font_tt,13), fg_color=color_blue,
+                                   corner_radius=12, height=28,
+                                   command=make_speaker_sep_callback())
+            sep_button.pack(pady=(0, 10), anchor='center')
+
+    checkbox_frame.update_idletasks()
+    canvas.configure(scrollregion=canvas.bbox("all"))
+
+
+# This function must be called only from the main thread
+def add_new_speaker_checkboxes_to_gui(new_speaker_items_list_of_dicts):
+    global checkbox_vars, checkbox_audio_paths, volume_sliders
+    
+    print(f"Adding {len(new_speaker_items_list_of_dicts)} new speaker tracks to GUI.")
+    for sp_item_dict in new_speaker_items_list_of_dicts:
+        sp_var = tk.BooleanVar(value=True)
+        
+        # Checkbox
+        cb_text = sp_item_dict.get('label', 'Unnamed Speaker Track')
+        sp_cb = CTkCheckBox(checkbox_frame, text=cb_text, variable=sp_var, 
+                             corner_radius=18, checkbox_width=25, checkbox_height=25, fg_color=color_blue,
+                             font=(font_tt, 12))
+        sp_cb.pack(anchor='center', pady=(8, 2), padx=10)
+
+        # Slider
+        sp_slider = CTkSlider(master=checkbox_frame, from_=0, to=200, orientation="horizontal", width=250)
+        sp_slider.set(100)
+        sp_slider.pack(pady=(0, 8), fill='x', padx=30, anchor='center')
+
+        checkbox_vars.append(sp_var)
+        checkbox_audio_paths.append(sp_item_dict) # Store the full dictionary
+        volume_sliders.append(sp_slider)
+
+    checkbox_frame.update_idletasks()
+    canvas.configure(scrollregion=canvas.bbox("all"))
+
+
+def play_selected_audios():
+    selected_waveforms = []
+    target_sr = 44100 # Common sample rate for mixing
+
+    active_items_to_play = []
+    for var, item_dict, slider in zip(checkbox_vars, checkbox_audio_paths, volume_sliders):
+        if var.get(): # If checkbox is checked
+            active_items_to_play.append({'dict': item_dict, 'slider_val': slider.get()})
+    
+    if not active_items_to_play:
+        messagebox.showinfo("No Audio Selected", "Please select at least one audio track to play.")
+        return
+
+    max_len = 0
+    processed_waveforms = []
+
+    for item_info in active_items_to_play:
+        path = item_info['dict'].get('path')
+        if not path or not os.path.exists(path):
+            messagebox.showwarning("File Not Found", f"Audio file not found: {path}. Skipping.")
+            print(f"Skipping missing file for playback: {path}")
+            continue
+        
+        try:
+            # Load with original SR and resample if necessary
+            waveform, current_sr = librosa.load(path, sr=None) 
+            if current_sr != target_sr:
+                waveform = librosa.resample(y=waveform, orig_sr=current_sr, target_sr=target_sr)
+            
+            # --- VOLUME APPLICATION: DIRECT AMPLITUDE SCALING ---
+            slider_val = item_info['slider_val'] # Value from 0 to 200
+            volume_multiplier = (slider_val / 100.0)**2 # Quadratic scaling
+    
+            # Apply the multiplier
+            waveform = waveform * volume_multiplier
+
+            processed_waveforms.append(waveform)
+            if len(waveform) > max_len:
+                max_len = len(waveform)
+        except Exception as e:
+            messagebox.showerror("Playback Load Error", f"Error loading or processing {path}: {e}")
+            print(f"Error during load/resample for playback {path}: {e}")
+            continue
+    
+    if not processed_waveforms:
+        if active_items_to_play: 
+            messagebox.showerror("Playback Error", "Could not load any of the selected audio files for playback.")
+        return
+
+    # Initialize a silent array for the mixed output
+    mixed_waveform = np.zeros(max_len)
+    
+    # Mix all processed waveforms by summing them
+    for wf in processed_waveforms:
+        mixed_waveform[:len(wf)] += wf # Add each waveform to the mix
+    try:
+        sd.stop() 
+        sd.play(mixed_waveform, target_sr) 
+    except Exception as e:
+        messagebox.showerror("Playback Error", f"Could not play mixed audio: {str(e)}")
+
+
+# Call Model Loaders
+def initial_model_load():
+    load_yamnet_model()
+    load_pyannote_pipeline()
+
+initial_model_load()
+
+# GUI
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+
+page1 = CTkFrame(root, fg_color="white")
+page2 = CTkFrame(root, fg_color="white")
+for frame in (page1, page2):
+    frame.grid(row=0, column=0, sticky='nsew')
+
+color_blue = "#4682B4"
+font_tt = "TT Hoves Pro Trial Medium" # Ensure this font is available or use a common one
+
+try:
+    # Test if font is available, otherwise fallback
+    test_label = CTkLabel(root, text="test", font=(font_tt, 10))
+    test_label.destroy()
+except Exception:
+    print(f"Font {font_tt} not found, using system default.")
+    font_tt = None
+
+
+# Page 1 "Upload Audio"
+page1_container = CTkFrame(page1,fg_color="white")
+page1_container.pack(expand=True) # Container with logo and upload audio button
+
+CTkLabel(page1_container, text="YourAmbiance ", text_color=color_blue, font=("Edwardian Script ITC" if font_tt is None else "Edwardian Script ITC", 60, "bold")).pack(pady=(30, 20))
+CTkButton(page1_container, text="Upload Audio File", command=select_audio, font=(font_tt, 20), corner_radius=16, fg_color=color_blue, width=200, height=40).pack(pady=10)
+
+# Page 2 "Results"
+CTkLabel(page2, text="Separated Sounds & Events", text_color=color_blue, font=(font_tt, 30, "bold")).pack(pady=(20,15), anchor="center")
+
+# Frame for canvas and scrollbar
+canvas_scrollbar_frame = CTkFrame(page2, fg_color="white")
+canvas_scrollbar_frame.pack(fill="both", expand=True, padx=10, pady=(0,5))
+canvas = CTkCanvas(canvas_scrollbar_frame, highlightthickness=0)
+scrollbar = CTkScrollbar(canvas_scrollbar_frame, orientation="vertical", command=canvas.yview)
+scrollable_frame = CTkFrame(canvas,fg_color="white")
+
+# Scrollable frame
+scrollable_frame.bind(
+    "<Configure>",
+    lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+)
+
+# Create canvas window for scrollable_frame
+scrollable_window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+
+# Configure scrollable_frame width to match canvas width - NEW
+def _on_canvas_configure(event):
+    if scrollable_window_id:
+        canvas.itemconfig(scrollable_window_id, width=event.width)
+canvas.bind("<Configure>", _on_canvas_configure)
+
+canvas.configure(yscrollcommand=scrollbar.set)
+
+# Pack canvas and scrollbar
+scrollbar.pack(side="right", fill="y")
+canvas.pack(side="left", fill="both", expand=True)
+
+checkbox_frame = scrollable_frame
+
+# Bottom buttons
+buttons_frame_page2 = CTkFrame(page2,fg_color="white")
+buttons_frame_page2.pack(pady=(5,15), fill="x", anchor="center")
+
+play_button = CTkButton(buttons_frame_page2, text="▶️ Play Selected Mix", font=(font_tt,18), corner_radius=16, fg_color="green", hover_color="darkgreen", height=35, command=play_selected_audios)
+play_button.pack(side="left", expand=True, padx=5)
+
+back_button = CTkButton(buttons_frame_page2, text="⬅️ Back to Home", font=(font_tt,18), corner_radius=16, fg_color=color_blue, height=35, command=lambda: show_frame(page1))
+back_button.pack(side="right", expand=True, padx=5)
+
+
+show_frame(page1)
+root.mainloop()
