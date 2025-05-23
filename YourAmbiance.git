@@ -274,7 +274,6 @@ def process_audio(file_path):
             root.after(0, lambda: messagebox.showerror("Processing Error", "Demucs audio separation failed. Please check console for details."))
         return []
 
-    # Removed: items_for_clustering list is no longer needed
 
     for i, demucs_item in enumerate(demucs_outputs): # Use enumerate to get an index for 'cluster'
         path = demucs_item['path']
@@ -291,7 +290,6 @@ def process_audio(file_path):
         else: 
             label_text = f"{', '.join(label_parts)}" if label_parts else "No significant sounds detected"
 
-        # Embeddings are still calculated for potential future use (e.g., more advanced analysis)
         embedding = np.zeros(1024) 
         try:
             waveform_for_embedding, _ = librosa.load(path, sr=16000, mono=True)
@@ -519,14 +517,12 @@ def play_selected_audios():
             continue
         
         try:
-            # Load with original SR and resample if necessary
             waveform, current_sr = librosa.load(path, sr=None) 
             if current_sr != target_sr:
                 waveform = librosa.resample(y=waveform, orig_sr=current_sr, target_sr=target_sr)
-            
-            # --- VOLUME APPLICATION: DIRECT AMPLITUDE SCALING ---
+
             slider_val = item_info['slider_val'] # Value from 0 to 200
-            volume_multiplier = (slider_val / 100.0)**2 # Quadratic scaling
+            volume_multiplier = (slider_val / 100.0)**2 # Quadratic scaling for better perceptual effect
     
             # Apply the multiplier
             waveform = waveform * volume_multiplier
@@ -587,7 +583,7 @@ except Exception:
 
 # Page 1 "Upload Audio"
 page1_container = CTkFrame(page1,fg_color="white")
-page1_container.pack(expand=True) # Container with logo and upload audio button
+page1_container.pack(expand=True) 
 
 CTkLabel(page1_container, text="YourAmbiance ", text_color=color_blue, font=("Edwardian Script ITC" if font_tt is None else "Edwardian Script ITC", 60, "bold")).pack(pady=(30, 20))
 CTkButton(page1_container, text="Upload Audio File", command=select_audio, font=(font_tt, 20), corner_radius=16, fg_color=color_blue, width=200, height=40).pack(pady=10)
@@ -611,7 +607,7 @@ scrollable_frame.bind(
 # Create canvas window for scrollable_frame
 scrollable_window_id = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 
-# Configure scrollable_frame width to match canvas width - NEW
+# Configure scrollable_frame width to match canvas width
 def _on_canvas_configure(event):
     if scrollable_window_id:
         canvas.itemconfig(scrollable_window_id, width=event.width)
