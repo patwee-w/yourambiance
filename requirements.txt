@@ -27,9 +27,6 @@ torchaudio==2.7.0+cpu
 # Demucs for source separation
 demucs==4.0.1
 
-# Scikit-learn for KMeans clustering
-scikit-learn==1.6.1
-
 # TensorFlow and TensorFlow Hub for YAMNet model
 tensorflow==2.19.0
 tensorflow-hub==0.16.1
