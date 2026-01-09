@@ -1,6 +1,6 @@
 # YourAmbiance Project
 
-**YourAmbiance** was developed as an entry for the Leagues of Code Hackathon held in May 2025. Using Demucs for sound separation, YAMNet for audio classification, and pyannote for speaker diarization, the app allows users to identify, isolate, and control specific audio elements in their environment through an interactive GUI. Guidelines are provided below to ensure full use. 
+**YourAmbiance** is an experimental prototype exploring AI-driven sound understanding and user-controlled audio filtering. The system integrates Demucs for sound separation, YAMNet for audio classification, and pyannote for speaker diarization, allowing users to identify, isolate, and adjust specific audio elements through an interactive GUI. This repository documents an early implementation that serves as a technical reference for ongoing and future development.
 
 ## 1) Hugging Face Hub Token is needed for pyannote to operate.
 
