@@ -4,7 +4,7 @@
 # ensuring reproducibility.
 
 # Python version
-3.10.9
+python==3.10.9
 
 # Core GUI
 customtkinter==5.2.2
@@ -18,8 +18,8 @@ pydub==0.25.1
 
 # Deep Learning Framework (PyTorch)
 # IMPORTANT: The '+cpu' in torch and torchaudio indicates a CPU-only installation.
-# If the user has an NVIDIA GPU and wants to use it, they will need to install
-# a CUDA-enabled version of PyTorch and torchaudio.
+# If the user has an NVIDIA GPU and wants to use it, they will need to install a CUDA-enabled version of PyTorch and torchaudio, which can be done by running
+# pip install --index-url https://download.pytorch.org/whl/cpu torch==2.7.0+cpu torchaudio==2.7.0+cpu.
 # Refer to: https://pytorch.org/get-started/locally/
 torch==2.7.0+cpu
 torchaudio==2.7.0+cpu
